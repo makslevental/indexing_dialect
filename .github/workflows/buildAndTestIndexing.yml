@@ -1,0 +1,94 @@
+name: Indexing Build and Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Indexing Build and Test (Release Asserts)
+    runs-on: ubuntu-latest
+    env:
+      LLVM_SYMBOLIZER_PATH: /usr/lib/llvm-11/bin/llvm-symbolizer
+    steps:
+    - name: Compute Indexing base path
+      run: |
+        echo "INDEXING_SOURCE_DIR=${GITHUB_WORKSPACE}/sandbox" | tee -a $GITHUB_ENV
+        echo "INDEXING_MAIN_BINARY_DIR=${GITHUB_WORKSPACE}/sandbox/build" | tee -a $GITHUB_ENV
+
+    - name: Set up Python
+      uses: actions/setup-python@13ae5bb136fac2878aff31522b9efb785519f984 # v4.3.0
+      with:
+        python-version: 3.11
+
+    - name: Checkout project
+      uses: actions/checkout@v3
+      with:
+        path: sandbox
+        submodules: recursive
+
+    - name: Install Python depends
+      run: |
+        python -m pip install -r ${INDEXING_SOURCE_DIR}/build-requirements.txt
+
+    - name: Install Ninja
+      uses: llvm/actions/install-ninja@6a57890d0e3f9f35dfc72e7e48bc5e1e527cdd6c # Jan 17
+
+    - name: Ccache for C++ compilation
+      uses: hendrikmuhs/ccache-action@621a41397ed83711c72862638d9ff6e63fca3041 # v1.2.3
+      with:
+        key: ${{ runner.os }}-indexing
+        # LLVM needs serious cache size
+        max-size: 6G
+
+    - name: Install CUDA
+      run: |
+        sudo apt install -y build-essential kmod
+        
+        wget -q https://developer.download.nvidia.com/compute/cuda/11.7.1/local_installers/cuda_11.7.1_515.65.01_linux.run
+        sudo sh cuda_11.7.1_515.65.01_linux.run --silent
+        if [[ $? -ne 0 ]]; then
+            echo "CUDA Installation Error."
+            exit 1
+        fi
+        ccache -s
+        
+        CUDA_PATH=/usr/local/cuda
+        echo "CUDA_PATH=${CUDA_PATH}"
+        export CUDA_PATH=${CUDA_PATH}
+        export PATH="$CUDA_PATH/bin:$PATH"
+        export LD_LIBRARY_PATH="$CUDA_PATH/lib:$LD_LIBRARY_PATH"
+        export LD_LIBRARY_PATH="$CUDA_PATH/lib64:$LD_LIBRARY_PATH"
+        # Check nvcc is now available.
+        nvcc -V
+        # If executed on github actions, make the appropriate echo statements to update the environment
+        # Set paths for subsequent steps, using ${CUDA_PATH}
+        echo "Adding CUDA to CUDA_PATH, PATH and LD_LIBRARY_PATH"
+        echo "CUDA_PATH=${CUDA_PATH}" >> $GITHUB_ENV
+        echo "${CUDA_PATH}/bin" >> $GITHUB_PATH
+        echo "LD_LIBRARY_PATH=${CUDA_PATH}/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
+        echo "LD_LIBRARY_PATH=${CUDA_PATH}/lib64:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
+
+    - name: Configure CMake
+      run: |
+        cmake \
+          -DLLVM_EXTERNAL_LIT=$(python -c 'import sys;print(sys.prefix)')/bin/lit \
+          -DPython3_EXECUTABLE=$(which python) \
+          -S${INDEXING_SOURCE_DIR} \
+          -B${INDEXING_MAIN_BINARY_DIR} -G Ninja
+        
+        echo "PYTHONPATH=${PYTHONPATH}:${INDEXING_MAIN_BINARY_DIR}/tools/indexing/python_packages" | tee -a $GITHUB_ENV
+
+    - name: Build
+      run: |
+        cmake --build ${INDEXING_MAIN_BINARY_DIR} --target all
+        ccache -s
+
+    - name: Run lit tests
+      run: |
+        cmake --build ${INDEXING_MAIN_BINARY_DIR} --target check-indexing
